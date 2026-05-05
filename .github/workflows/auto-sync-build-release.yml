@@ -1,0 +1,420 @@
+name: auto-sync-build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Build and publish even when upstream has no new commit"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "23 */6 * * *"
+
+concurrency:
+  group: auto-sync-build-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.38.x"
+  UPSTREAM_REPO: "https://github.com/xiaoyaocz/dart_simple_live.git"
+  RELEASE_PREFIX: "autosync"
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-22.04
+    outputs:
+      should_build: ${{ steps.sync.outputs.should_build }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      synced_sha: ${{ steps.sync.outputs.synced_sha }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Merge upstream master
+        id: sync
+        shell: bash
+        env:
+          FORCE_RELEASE: ${{ inputs.force_release || false }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream master --tags
+
+          upstream_sha="$(git rev-parse upstream/master)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            if [[ "$FORCE_RELEASE" != "true" ]]; then
+              echo "No upstream updates."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "release_tag=" >> "$GITHUB_OUTPUT"
+              echo "synced_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            git merge --no-edit --no-ff upstream/master
+            git push origin HEAD:master
+          fi
+
+          synced_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          timestamp="$(date -u +'%Y%m%d%H%M%S')"
+          release_tag="${RELEASE_PREFIX}-${timestamp}-${short_sha}"
+
+          git tag -a "$release_tag" -m "Auto sync upstream ${upstream_sha}"
+          git push origin "refs/tags/${release_tag}"
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "synced_sha=$synced_sha" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    name: Build Android and Android TV
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.release_tag }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Configure Android signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          TV_KEYSTORE_BASE64: ${{ secrets.TV_KEYSTORE_BASE64 }}
+          TV_STORE_PASSWORD: ${{ secrets.TV_STORE_PASSWORD }}
+          TV_KEY_PASSWORD: ${{ secrets.TV_KEY_PASSWORD }}
+          TV_KEY_ALIAS: ${{ secrets.TV_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+
+          write_key_properties() {
+            local project_dir="$1"
+            local keystore_base64="$2"
+            local store_password="$3"
+            local key_password="$4"
+            local key_alias="$5"
+            local fallback_name="$6"
+            local keystore_path="$RUNNER_TEMP/${fallback_name}.jks"
+
+            if [[ -n "$keystore_base64" ]]; then
+              printf '%s' "$keystore_base64" | base64 -d > "$keystore_path"
+            else
+              store_password="${store_password:-simplelive}"
+              key_password="${key_password:-simplelive}"
+              key_alias="${key_alias:-simplelive}"
+              keytool -genkeypair -v \
+                -keystore "$keystore_path" \
+                -storepass "$store_password" \
+                -keypass "$key_password" \
+                -alias "$key_alias" \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Simple Live CI, OU=CI, O=Simple Live, L=Shanghai, S=Shanghai, C=CN"
+            fi
+
+            cat > "${project_dir}/android/key.properties" <<EOF
+          storeFile=${keystore_path}
+          storePassword=${store_password:-simplelive}
+          keyPassword=${key_password:-simplelive}
+          keyAlias=${key_alias:-simplelive}
+          EOF
+          }
+
+          write_key_properties simple_live_app "${KEYSTORE_BASE64:-}" "${STORE_PASSWORD:-}" "${KEY_PASSWORD:-}" "${KEY_ALIAS:-}" app
+          write_key_properties simple_live_tv_app "${TV_KEYSTORE_BASE64:-}" "${TV_STORE_PASSWORD:-}" "${TV_KEY_PASSWORD:-}" "${TV_KEY_ALIAS:-}" tv
+
+      - name: Build Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd simple_live_app
+          flutter pub get
+          flutter build apk --release --split-per-abi
+
+      - name: Build Android TV APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd simple_live_tv_app
+          flutter pub get
+          flutter build apk --release --split-per-abi
+
+      - name: Stage Android artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp simple_live_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk release/simple-live-android-armeabi-v7a.apk
+          cp simple_live_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk release/simple-live-android-arm64-v8a.apk
+          cp simple_live_app/build/app/outputs/flutter-apk/app-x86_64-release.apk release/simple-live-android-x86_64.apk
+          cp simple_live_tv_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk release/simple-live-android-tv-armeabi-v7a.apk
+          cp simple_live_tv_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk release/simple-live-android-tv-arm64-v8a.apk
+          cp simple_live_tv_app/build/app/outputs/flutter-apk/app-x86_64-release.apk release/simple-live-android-tv-x86_64.apk
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: release/*
+          if-no-files-found: error
+
+  build-apple:
+    name: Build iOS and macOS
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.release_tag }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g appdmg
+          dart pub global activate flutter_distributor
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Build iOS unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd simple_live_app
+          flutter pub get
+          flutter build ios --release --no-codesign
+          rm -rf build/ios/iphoneos/Payload
+          mkdir -p build/ios/iphoneos/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/Runner.app
+          (cd build/ios/iphoneos && zip -q -r ios_no_sign.ipa Payload)
+
+      - name: Build macOS packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter config --enable-macos-desktop
+          cd simple_live_app
+          flutter_distributor package --platform macos --targets dmg,zip --skip-clean
+
+      - name: Stage Apple artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp simple_live_app/build/ios/iphoneos/ios_no_sign.ipa release/simple-live-ios-nosign.ipa
+          find simple_live_app/build/dist -type f \( -name '*.dmg' -o -name '*.zip' \) -print0 |
+            while IFS= read -r -d '' file; do
+              cp "$file" "release/simple-live-macos-$(basename "$file")"
+            done
+          test "$(find release -type f | wc -l)" -gt 0
+
+      - name: Upload Apple artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple
+          path: release/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.release_tag }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install NuGet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nugetDir = Join-Path $env:RUNNER_TEMP 'nuget'
+          New-Item -ItemType Directory -Force -Path $nugetDir | Out-Null
+          Invoke-WebRequest -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' -OutFile (Join-Path $nugetDir 'nuget.exe')
+          Add-Content -Path $env:GITHUB_PATH -Value $nugetDir
+
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          dart pub global activate flutter_distributor
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\Pub\Cache\bin"
+
+      - name: Build Windows packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter config --enable-windows-desktop
+          cd simple_live_app
+          flutter pub get
+          flutter_distributor package --platform windows --targets msix,zip --skip-clean
+
+      - name: Stage Windows artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Get-ChildItem -Path simple_live_app\build\dist -Recurse -File -Include *.msix,*.zip | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path 'release' ('simple-live-windows-' + $_.Name)) -Force
+          }
+          if ((Get-ChildItem -Path release -File | Measure-Object).Count -eq 0) { throw 'No Windows artifacts found.' }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: release/*
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.release_tag }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libasound2-dev libmpv-dev mpv
+
+      - name: Install packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart pub global activate flutter_distributor
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Build Linux packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter config --enable-linux-desktop
+          cd simple_live_app
+          flutter pub get
+          flutter_distributor package --platform linux --targets deb,zip --skip-clean
+
+      - name: Stage Linux artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find simple_live_app/build/dist -type f \( -name '*.deb' -o -name '*.zip' \) -print0 |
+            while IFS= read -r -d '' file; do
+              cp "$file" "release/simple-live-linux-$(basename "$file")"
+            done
+          test "$(find release -type f | wc -l)" -gt 0
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - sync
+      - build-android
+      - build-apple
+      - build-windows
+      - build-linux
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          Automated build for fork sync.
+
+          - Upstream: xiaoyaocz/dart_simple_live@${{ needs.sync.outputs.upstream_sha }}
+          - Fork commit: ${{ needs.sync.outputs.synced_sha }}
+          - Tag: ${{ needs.sync.outputs.release_tag }}
+
+          iOS artifact is unsigned. Android artifacts use configured signing secrets when present; otherwise they are signed with a temporary CI key.
+          EOF
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync.outputs.release_tag }}
+          name: ${{ needs.sync.outputs.release_tag }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          files: release-assets/*
